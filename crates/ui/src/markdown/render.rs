@@ -133,6 +133,9 @@ pub use super::links::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
 pub struct LinkUi {
     pub source_session: Option<String>,
     pub handler: Rc<dyn Fn(&LinkActivation, &mut Window, &mut gpui::App) -> LinkOutcome>,
+    /// Resolve only files that can be revealed on this device. The menu uses
+    /// this to omit the action for remote workspaces and missing files.
+    pub local_file_path: Option<Rc<dyn Fn(&str, &str, &gpui::App) -> Option<std::path::PathBuf>>>,
 }
 
 pub fn activate_link(

@@ -975,6 +975,7 @@ impl MarkdownPreview {
         let open_web_link = self.open_web_link.clone();
         LinkUi {
             source_session: None,
+            local_file_path: None,
             handler: Rc::new(move |activation, _, cx| {
                 if weak.upgrade().is_none() {
                     return render::LinkOutcome::Rejected;

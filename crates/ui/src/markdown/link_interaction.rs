@@ -15,6 +15,16 @@ use std::{
     rc::Rc,
 };
 
+fn file_manager_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Show in Finder"
+    } else if cfg!(windows) {
+        "Show in Explorer"
+    } else {
+        "Show in File Manager"
+    }
+}
+
 #[cfg(feature = "browser-fixture")]
 thread_local! {
     static FIXTURE_LINKS: RefCell<std::collections::HashMap<String, (Point<Pixels>, FocusHandle)>> = RefCell::default();
@@ -34,7 +44,7 @@ pub struct LinkRanges {
 struct Interaction {
     targets: Vec<LinkTarget>,
     focus: Vec<FocusHandle>,
-    menu_focus: [FocusHandle; 4],
+    menu_focus: [FocusHandle; 5],
     menu_focus_pending: Rc<Cell<bool>>,
     menu: Rc<RefCell<Option<(usize, Point<Pixels>)>>>,
     bounds: Bounds<Pixels>,
@@ -271,6 +281,15 @@ impl Element for LinkRanges {
                 }
             }
             if let Some((index, position)) = *state.menu.borrow() {
+                let show_reveal = state.targets[index].navigation.is_err()
+                    && self.ui.as_ref().is_some_and(|ui| {
+                        ui.source_session.as_deref().is_some_and(|session| {
+                            ui.local_file_path.as_ref().is_some_and(|resolve| {
+                                resolve(&state.targets[index].original, session, cx).is_some()
+                            })
+                        })
+                    });
+                let menu_focus_count = if show_reveal { 5 } else { 4 };
                 let theme = theme.for_popup();
                 let menu = state.menu.clone();
                 let dismiss_menu = state.menu.clone();
@@ -305,15 +324,16 @@ impl Element for LinkRanges {
                             "tab" | "down" | "up" => {
                                 let current = menu_focus
                                     .iter()
+                                    .take(menu_focus_count)
                                     .position(|focus| focus.is_focused(window))
                                     .unwrap_or(0);
                                 let backwards = event.keystroke.key == "up"
                                     || (event.keystroke.key == "tab"
                                         && event.keystroke.modifiers.shift);
                                 let next = if backwards {
-                                    (current + menu_focus.len() - 1) % menu_focus.len()
+                                    (current + menu_focus_count - 1) % menu_focus_count
                                 } else {
-                                    (current + 1) % menu_focus.len()
+                                    (current + 1) % menu_focus_count
                                 };
                                 window.focus(&menu_focus[next], cx);
                             }
@@ -367,6 +387,41 @@ impl Element for LinkRanges {
                         }),
                     );
                 }
+                if show_reveal {
+                    let target = state.targets[index].clone();
+                    let ui = self.ui.clone();
+                    let menu = state.menu.clone();
+                    let label = file_manager_label();
+                    card = card.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("{}-link-{index}-reveal", self.id),
+                        )
+                        .id(label)
+                        .child(
+                            icons::icon(icons::FOLDER)
+                                .size(px(16.))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(label)
+                        .track_focus(&state.menu_focus[3])
+                        .role(Role::Button)
+                        .aria_label(label)
+                        .focus_visible(|s| s.bg(crate::theme::card_selected_bg()))
+                        .on_click(move |_, window, cx| {
+                            activate_link(
+                                target.clone(),
+                                LinkAction::Reveal,
+                                ui.as_ref(),
+                                window,
+                                cx,
+                            );
+                            menu.borrow_mut().take();
+                            window.refresh();
+                        }),
+                    );
+                }
                 let open_in_zeron = crate::settings::current(cx).open_web_links_in_zeron;
                 let menu = state.menu.clone();
                 card = card.child(popover::menu_separator()).child(
@@ -384,7 +439,7 @@ impl Element for LinkRanges {
                         )
                     }))
                     .child("Open links in Zeron")
-                    .track_focus(&state.menu_focus[3])
+                    .track_focus(&state.menu_focus[if show_reveal { 4 } else { 3 }])
                     .role(Role::Button)
                     .aria_label(if open_in_zeron {
                         "Open links in Zeron, checked"
@@ -512,11 +567,16 @@ mod tests {
                     cx.read_from_clipboard().unwrap().text().as_deref(),
                     Some(target.original.as_str())
                 );
-                for action in [LinkAction::Internal, LinkAction::External] {
+                for action in [
+                    LinkAction::Internal,
+                    LinkAction::External,
+                    LinkAction::Reveal,
+                ] {
                     let seen = Rc::new(RefCell::new(None));
                     let captured = seen.clone();
                     let ui = LinkUi {
                         source_session: Some("parent".into()),
+                        local_file_path: None,
                         handler: Rc::new(move |a, _, _| {
                             *captured.borrow_mut() =
                                 Some((a.target.clone(), a.action, a.source_session.clone()));
@@ -584,6 +644,7 @@ mod rendered_tests {
             let activated = self.activated.clone();
             opts.link = Some(LinkUi {
                 source_session: Some("session".into()),
+                local_file_path: None,
                 handler: Rc::new(move |a, _, _| {
                     activated.borrow_mut().push(a.clone());
                     LinkOutcome::Rejected

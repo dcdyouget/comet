@@ -23,6 +23,8 @@ pub enum LinkAction {
     Internal,
     External,
     Copy,
+    /// Select a local workspace file in the system file manager.
+    Reveal,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkOutcome {
@@ -38,6 +40,9 @@ pub struct LinkActivation {
 }
 impl LinkActivation {
     pub fn web_outcome(&self, embedded: bool) -> LinkOutcome {
+        if self.action == LinkAction::Reveal {
+            return LinkOutcome::Rejected;
+        }
         match &self.target.navigation {
             Ok(_) if embedded && self.action == LinkAction::Internal => LinkOutcome::Internal,
             Ok(url) => LinkOutcome::External(url.clone()),
@@ -71,6 +76,8 @@ mod tests {
             LinkOutcome::External("https://example.com/".into()),
             "Primary must be resolved by the owning surface"
         );
+        a.action = LinkAction::Reveal;
+        assert_eq!(a.web_outcome(true), LinkOutcome::Rejected);
     }
     #[test]
     fn rejected_targets_never_fall_back() {

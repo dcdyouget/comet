@@ -1751,6 +1751,29 @@ pub struct Shell {
     _transcript_invalidation: Subscription,
 }
 
+/// Finder/Explorer can only reveal files held by the selected local session.
+fn local_workspace_file_path(
+    state: &AppState,
+    source_session: &str,
+    target: &str,
+) -> Option<PathBuf> {
+    if state.selected_chat.as_deref() != Some(source_session) {
+        return None;
+    }
+    let chat = state.selected_chat_row()?;
+    if state.local_device_id.as_deref() != Some(chat.device_id.as_str()) {
+        return None;
+    }
+    let root = chat.cwd.as_deref()?;
+    let root_path = std::path::Path::new(root);
+    if !root_path.is_absolute() {
+        return None;
+    }
+    let link = resolve_workspace_file_link(target, root)?;
+    let path = root_path.join(link.path);
+    path.exists().then_some(path)
+}
+
 impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
@@ -1760,7 +1783,7 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-        let links = Self::session_links(None, cx);
+        let links = Self::session_links(state.clone(), None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
         });
@@ -2854,6 +2877,7 @@ impl Shell {
     }
 
     fn session_links(
+        state: Entity<AppState>,
         source_session: Option<String>,
         cx: &Context<Self>,
     ) -> crate::markdown::render::LinkUi {
@@ -2867,6 +2891,9 @@ impl Shell {
                     })
                     .unwrap_or(crate::markdown::render::LinkOutcome::Rejected)
             }),
+            local_file_path: Some(std::rc::Rc::new(move |target, session, cx| {
+                local_workspace_file_path(&state.read(cx), session, target)
+            })),
         }
     }
 
@@ -2882,6 +2909,19 @@ impl Shell {
             || self.state.read(cx).selected_chat.as_deref() != Some(self.active_chat.as_str())
         {
             return LinkOutcome::Rejected;
+        }
+        if activation.action == LinkAction::Reveal {
+            let path = local_workspace_file_path(
+                &self.state.read(cx),
+                &self.active_chat,
+                &activation.target.original,
+            );
+            return if let Some(path) = path {
+                cx.reveal_path(&path);
+                LinkOutcome::Internal
+            } else {
+                LinkOutcome::Rejected
+            };
         }
         if activation.target.navigation.is_err() {
             return if matches!(
@@ -3228,7 +3268,7 @@ impl Shell {
         // a frozen one reads top-down.
         let transcript =
             cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
-        let links = Self::session_links(Some(self.active_chat.clone()), cx);
+        let links = Self::session_links(self.state.clone(), Some(self.active_chat.clone()), cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
         });
@@ -11124,6 +11164,51 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revealable_workspace_file_requires_local_selected_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a file.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.selected_chat = Some("owner".into());
+        state.chats.push(zeron_proto::Chat {
+            id: "owner".into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+            parent_chat_id: None,
+        });
+
+        assert_eq!(
+            local_workspace_file_path(&state, "owner", "a file.rs:2"),
+            Some(file.clone())
+        );
+        assert_eq!(
+            local_workspace_file_path(&state, "owner", "zeron-file:a%20file.rs"),
+            Some(file)
+        );
+        for target in ["missing.rs", "../outside.rs", "https://example.com/a.rs"] {
+            assert!(local_workspace_file_path(&state, "owner", target).is_none());
+        }
+        assert!(local_workspace_file_path(&state, "stale-owner", "a file.rs").is_none());
+        state.chats[0].device_id = "remote".into();
+        assert!(local_workspace_file_path(&state, "owner", "a file.rs").is_none());
+    }
 
     #[test]
     fn sidebar_drag_nudges_each_edge_once_until_rearmed() {
