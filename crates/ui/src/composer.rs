@@ -3848,6 +3848,21 @@ impl ComposerInput {
         self.content_height
     }
 
+    fn scroll_fade_edges(&self, visible_height: f32) -> (bool, bool) {
+        // Compact comments have no spare space for the main composer's
+        // ascent inset and 12px fade. Their scrollbar already signals overflow.
+        if self.scrollable_viewport {
+            return (false, false);
+        }
+        input_overflow_edges(
+            self.content_height,
+            self.settled_viewport_height
+                .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
+            visible_height,
+            self.scroll_top,
+        )
+    }
+
     fn paint_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         let visible = f32::from(bounds.size.height);
         let top_overflow = input_overflow_edges(
@@ -4722,14 +4737,7 @@ impl Render for ComposerInput {
                     let visible_height = input
                         .last_bounds
                         .map_or(0.0, |bounds| f32::from(bounds.size.height));
-                    input_overflow_edges(
-                        input.content_height,
-                        input
-                            .settled_viewport_height
-                            .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
-                        visible_height,
-                        input.scroll_top,
-                    )
+                    input.scroll_fade_edges(visible_height)
                 })
             })
             .children(scrollbar)
@@ -13076,6 +13084,31 @@ mod tests {
             input_scroll_offset_for_cursor(0.0, 290.0, 20.0, 300.0, 100.0, None),
             200.0
         );
+    }
+
+    #[gpui::test]
+    fn compact_comments_do_not_fade_visible_text_at_scroll_edges(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, _, cx| {
+            input.content_height = 300.0;
+            for height in [36.0, 46.0] {
+                for offset in [0.0, 100.0, 300.0 - height] {
+                    input.scroll_top = offset;
+                    input.scrollable_viewport = false;
+                    input.settled_viewport_height = Some(height);
+                    assert_eq!(
+                        input.scroll_fade_edges(height),
+                        (offset > 1.0, offset < 300.0 - height - 1.0),
+                        "the main composer retains its existing overflow fades"
+                    );
+                    input.set_scrollable_viewport(height, cx);
+                    assert_eq!(
+                        input.scroll_fade_edges(height),
+                        (false, false),
+                        "a compact comment must not fade visible rows at offset {offset}"
+                    );
+                }
+            }
+        });
     }
 
     #[gpui::test]
