@@ -1928,7 +1928,6 @@ impl ComposerInput {
         self.settled_viewport_height = Some(height);
         self.resizing = false;
         self.overflow_top_padding = 0.0;
-        self.comment_scrollbar.set_persistent(true);
         self
     }
 
@@ -1947,7 +1946,6 @@ impl ComposerInput {
         self.settled_viewport_height = Some(height);
         self.resizing = false;
         self.overflow_top_padding = 0.0;
-        self.comment_scrollbar.set_persistent(true);
         self.scroll_top = self
             .scroll_top
             .min(input_max_scroll(self.content_height, height));
@@ -3848,12 +3846,19 @@ impl ComposerInput {
         self.content_height
     }
 
-    fn scroll_fade_edges(&self, visible_height: f32) -> (bool, bool) {
-        // Compact comments have no spare space for the main composer's
-        // ascent inset and 12px fade. Their scrollbar already signals overflow.
+    fn scroll_fade_geometry(&self) -> (f32, f32) {
         if self.scrollable_viewport {
-            return (false, false);
+            // Keep one full row outside the edge ramps. Compact comments do
+            // not have the chat composer's top padding to fade underneath.
+            let height = self.viewport_height.unwrap_or(self.configured_line_height);
+            let band = ((height - self.configured_line_height) / 2.0).clamp(0.0, INPUT_FADE_BAND);
+            (band, 0.0)
+        } else {
+            (INPUT_FADE_BAND, self.max_ascent - self.overflow_top_padding)
         }
+    }
+
+    fn scroll_fade_edges(&self, visible_height: f32) -> (bool, bool) {
         input_overflow_edges(
             self.content_height,
             self.settled_viewport_height
@@ -4709,16 +4714,24 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
-            .when(scrollable_viewport, |el| el.relative().pr(px(12.0)))
+            .when(scrollable_viewport, |el| {
+                el.relative()
+                    .pr(px(12.0))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if this.comment_scrollbar.set_list_hovered(*hovered) {
+                            cx.notify();
+                        }
+                    }))
+            })
             .text_size(crate::typography::ui_rems(self.text_size))
             .line_height(crate::typography::ui_rems(self.configured_line_height))
             .text_color(text_color)
             .font_family(theme.font_sans.clone())
             .child({
                 let input = cx.entity();
-                let ascent = self.max_ascent;
+                let (fade_band, fade_inset) = self.scroll_fade_geometry();
                 crate::edge_fade::edge_faded(
-                    INPUT_FADE_BAND,
+                    fade_band,
                     true,
                     true,
                     ComposerTextElement {
@@ -4728,10 +4741,9 @@ impl Render for ComposerInput {
                             .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
                     },
                 )
-                // Fade through the existing top padding, like the transcript
-                // scrolling under its chrome. Account for GPUI's baseline
-                // sampling without consuming another inset inside the text box.
-                .inset_top(ascent - self.overflow_top_padding)
+                // The main composer fades through its top padding; compact
+                // fields keep both ramps at the viewport edges.
+                .inset_top(fade_inset)
                 .fade_overflow_y_with(move |cx| {
                     let input = input.read(cx);
                     let visible_height = input
@@ -13087,26 +13099,35 @@ mod tests {
     }
 
     #[gpui::test]
-    fn compact_comments_do_not_fade_visible_text_at_scroll_edges(cx: &mut gpui::TestAppContext) {
+    fn compact_comment_fades_preserve_a_readable_row_and_endpoints(cx: &mut gpui::TestAppContext) {
         with_composer_input(cx, |input, _, cx| {
             input.content_height = 300.0;
+            assert_eq!(
+                input.scroll_fade_geometry(),
+                (
+                    INPUT_FADE_BAND,
+                    input.max_ascent - input.overflow_top_padding
+                )
+            );
             for height in [36.0, 46.0] {
-                for offset in [0.0, 100.0, 300.0 - height] {
-                    input.scroll_top = offset;
-                    input.scrollable_viewport = false;
-                    input.settled_viewport_height = Some(height);
-                    assert_eq!(
-                        input.scroll_fade_edges(height),
-                        (offset > 1.0, offset < 300.0 - height - 1.0),
-                        "the main composer retains its existing overflow fades"
-                    );
-                    input.set_scrollable_viewport(height, cx);
-                    assert_eq!(
-                        input.scroll_fade_edges(height),
-                        (false, false),
-                        "a compact comment must not fade visible rows at offset {offset}"
-                    );
-                }
+                input.set_scrollable_viewport(height, cx);
+                let (band, inset) = input.scroll_fade_geometry();
+                assert_eq!(inset, 0.0, "compact comments have no top chrome");
+                assert!(band > 0.0 && band <= INPUT_FADE_BAND);
+                assert!(
+                    height - inset - 2.0 * band >= input.configured_line_height,
+                    "opposing fades must leave at least one full row readable"
+                );
+                input.scroll_top = 0.0;
+                assert_eq!(input.scroll_fade_edges(height), (false, true));
+                input.scroll_top = 100.0;
+                assert_eq!(input.scroll_fade_edges(height), (true, true));
+                input.scroll_top = 300.0 - height;
+                assert_eq!(input.scroll_fade_edges(height), (true, false));
+                assert!(
+                    height - input.configured_line_height >= inset + band,
+                    "the final row must be outside the top fade at the bottom"
+                );
             }
         });
     }
@@ -13185,7 +13206,6 @@ mod tests {
                             .rail_metrics()
                             .expect("long comments expose a scrollbar");
                         assert_eq!(metrics.max_scroll, max_scroll);
-                        assert!(input.comment_scrollbar.visible());
 
                         input.on_scroll_wheel(
                             &ScrollWheelEvent {

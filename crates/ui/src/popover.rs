@@ -1465,7 +1465,6 @@ impl gpui::Render for MenuScrollbarDragGhost {
 /// wake-ups scheduled so the fade lands without any further input.
 #[derive(Default)]
 pub struct MenuScrollbarState {
-    persistent: bool,
     list_hovered: bool,
     bar_hovered: bool,
     grab: Option<f32>,
@@ -1479,12 +1478,6 @@ pub struct MenuScrollbarState {
 }
 
 impl MenuScrollbarState {
-    /// Keep compact input rails discoverable whenever their content overflows.
-    /// Other surfaces retain the default scroll-triggered fade behavior.
-    pub fn set_persistent(&mut self, persistent: bool) {
-        self.persistent = persistent;
-    }
-
     /// Record scroll activity from the live handle. Call once per render
     /// before [`Self::metrics`]/[`Self::render_rail`]; a changed offset marks
     /// the rail as recently scrolled.
@@ -1547,16 +1540,13 @@ impl MenuScrollbarState {
     /// alone shows nothing, scrolling shows it even with the pointer
     /// elsewhere (touchpad momentum), and hover+scroll is the common case.
     pub fn visible(&self) -> bool {
-        self.persistent
-            || self.grab.is_some()
-            || self.bar_hovered
-            || self.scroll_countdown(Instant::now())
+        self.grab.is_some() || self.bar_hovered || self.scroll_countdown(Instant::now())
     }
 
     /// 1 → 0 across the fade window once the scroll motion stops; full while
     /// a drag or a track-hover holds the rail open.
     pub fn fade(&self) -> f32 {
-        if self.persistent || self.grab.is_some() || self.bar_hovered {
+        if self.grab.is_some() || self.bar_hovered {
             return 1.0;
         }
         let Some(at) = self.last_scroll_at else {
@@ -1569,7 +1559,7 @@ impl MenuScrollbarState {
     }
 
     fn animating_at(&self, now: Instant) -> bool {
-        !self.persistent && self.grab.is_none() && !self.bar_hovered && self.scroll_countdown(now)
+        self.grab.is_none() && !self.bar_hovered && self.scroll_countdown(now)
     }
 
     /// When the countdown next needs a repaint: the rest of the linger (the
@@ -2243,25 +2233,6 @@ mod tests {
         assert_eq!(m.thumb_left, 92.0 - MENU_SCROLLBAR_MIN_THUMB);
         let m = HorizontalScrollbarMetrics::from_viewport(100.0, 9900.0, -3.0).unwrap();
         assert_eq!(m.thumb_left, 0.0);
-    }
-
-    #[test]
-    fn persistent_input_scrollbar_stays_visible_without_hide_wakes() {
-        let mut bar = MenuScrollbarState::default();
-        assert!(!bar.visible());
-        bar.set_persistent(true);
-        assert!(bar.visible());
-        assert_eq!(bar.fade(), 1.0);
-        bar.note_scroll_offset(0.0);
-        bar.note_scroll_offset(20.0);
-        assert_eq!(bar.arm_hide_timer(), None);
-        bar.set_bar_hovered(true);
-        bar.set_bar_hovered(false);
-        let later = Instant::now()
-            + Duration::from_millis(MENU_SCROLLBAR_LINGER_MS + MENU_SCROLLBAR_FADE_MS + 1);
-        assert!(!bar.animating_at(later));
-        assert!(bar.visible());
-        assert_eq!(bar.fade(), 1.0);
     }
 
     #[test]
