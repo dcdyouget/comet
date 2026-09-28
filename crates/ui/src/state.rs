@@ -761,8 +761,9 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
+    /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
+    /// standing stream may be backed by subprocess and network probes.
+    pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -841,7 +842,7 @@ impl AppState {
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
-            update: None,
+            harness_updates: Vec::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -1281,8 +1282,8 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
-        self.update = Some(status);
+    pub fn apply_harness_updates(&mut self, statuses: Vec<zeron_proto::HarnessUpdateStatus>) {
+        self.harness_updates = statuses;
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -1946,7 +1947,6 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
-        self.update = None;
         cx.notify();
     }
 
@@ -2081,8 +2081,13 @@ impl AppState {
         // baseline instead of comparing the new runtime with the old one.
         self.connectivity_observed = false;
         let engine_info = handle.engine_info();
+        let supports_harness_updates =
+            engine_info.supports(zeron_proto::capabilities::HARNESS_UPDATES_V1);
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
+        if !supports_harness_updates {
+            self.harness_updates.clear();
+        }
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(10);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
@@ -2135,17 +2140,19 @@ impl AppState {
                 state.apply_auth_value(value);
                 true
             }),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                |state, value| {
-                    state.apply_update(value);
-                    true
-                },
-            ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
+        if supports_harness_updates {
+            watch_tasks.push(spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_HARNESS_UPDATES,
+                |state, value| {
+                    state.apply_harness_updates(value);
+                    true
+                },
+            ));
+        }
         self.watch_tasks = watch_tasks;
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
