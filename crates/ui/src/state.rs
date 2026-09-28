@@ -691,6 +691,9 @@ pub struct AppState {
     pub chats: Vec<Chat>,
     /// Fork RPC may arrive ahead of its registry row on a remote device.
     pending_side_chat: Option<Chat>,
+    /// `pending_side_chat` was started by hand and nothing has minted it:
+    /// no registry row, no doc, until its first send.
+    unsaved_side_chat: bool,
     pub sessions: Vec<Session>,
     /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
     /// this and continue reading their device-local settings entry.
@@ -758,8 +761,9 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
+    /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
+    /// standing stream may be backed by subprocess and network probes.
+    pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -815,6 +819,7 @@ impl AppState {
             spaces: Vec::new(),
             chats: Vec::new(),
             pending_side_chat: None,
+            unsaved_side_chat: false,
             sessions: Vec::new(),
             sidebar_preferences: SidebarPreferencesState::default(),
             session_presentation: None,
@@ -837,7 +842,7 @@ impl AppState {
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
-            update: None,
+            harness_updates: Vec::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -1114,6 +1119,15 @@ impl AppState {
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
     pub fn apply_chat_config(&mut self, chat_id: &str, config: zeron_proto::ChatConfig) {
+        // The pending side chat's copy is what `apply_chats` re-inserts and
+        // what an unsaved one is minted from.
+        if let Some(chat) = self
+            .pending_side_chat
+            .as_mut()
+            .filter(|chat| chat.id == chat_id)
+        {
+            chat.config = Some(config.clone());
+        }
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
@@ -1268,8 +1282,8 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
-        self.update = Some(status);
+    pub fn apply_harness_updates(&mut self, statuses: Vec<zeron_proto::HarnessUpdateStatus>) {
+        self.harness_updates = statuses;
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -1910,6 +1924,7 @@ impl AppState {
         self.spaces.clear();
         self.chats.clear();
         self.pending_side_chat = None;
+        self.unsaved_side_chat = false;
         self.sessions.clear();
         self.sidebar_preferences = SidebarPreferencesState::default();
         self.session_presentation = None;
@@ -1932,14 +1947,17 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
-        self.update = None;
         cx.notify();
     }
 
     /// Independent selection and transcript subscriptions over the same engine.
+    /// An `unsaved` chat is a hand-started side chat nothing has written yet:
+    /// it opens no doc until its first send mints it (see
+    /// [`Self::unsaved_side_chat_create`]).
     pub(crate) fn side_chat_state(
         parent: &Entity<Self>,
         chat: Chat,
+        unsaved: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let source = parent.read(cx);
@@ -1954,11 +1972,69 @@ impl AppState {
         state.data_dir = source.data_dir.clone();
         state.auto_selected = true;
         state.pending_side_chat = Some(chat.clone());
+        state.unsaved_side_chat = unsaved;
         if let Some(engine) = engine {
             state.attach_engine(engine, cx);
         }
         state.select_chat(Some(chat.id), cx);
         state
+    }
+
+    /// This is a side chat's state whose chat its first send has yet to mint.
+    pub(crate) fn side_chat_unsaved(&self) -> bool {
+        self.unsaved_side_chat
+    }
+
+    fn is_unsaved_side_chat(&self, chat_id: &str) -> bool {
+        self.unsaved_side_chat
+            && self
+                .pending_side_chat
+                .as_ref()
+                .is_some_and(|chat| chat.id == chat_id)
+    }
+
+    /// The `Mutate createChat` params that mint the unsaved side chat
+    /// `chat_id` on its first send; `None` once it exists.
+    pub(crate) fn unsaved_side_chat_create(&self, chat_id: &str) -> Option<serde_json::Value> {
+        if !self.is_unsaved_side_chat(chat_id) {
+            return None;
+        }
+        let chat = self.pending_side_chat.as_ref()?;
+        Some(serde_json::json!({
+            "op": "createChat",
+            "chatId": chat.id,
+            "deviceId": chat.device_id,
+            "spaceId": chat.space_id,
+            "config": chat.config,
+            "branch": chat.branch,
+            "cwd": chat.cwd,
+            "parentChatId": chat.parent_chat_id,
+        }))
+    }
+
+    /// The unsaved side chat now exists: attach the doc watches it deferred.
+    pub(crate) fn side_chat_saved(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if !self.is_unsaved_side_chat(chat_id) {
+            return;
+        }
+        self.unsaved_side_chat = false;
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            self.focus_chat_sync(chat_id, cx);
+            self.start_chat_watches(chat_id.to_owned(), cx);
+        }
+    }
+
+    fn start_chat_watches(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.transcript_task = Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
     }
 
     // ---- gpui glue ----
@@ -2005,8 +2081,13 @@ impl AppState {
         // baseline instead of comparing the new runtime with the old one.
         self.connectivity_observed = false;
         let engine_info = handle.engine_info();
+        let supports_harness_updates =
+            engine_info.supports(zeron_proto::capabilities::HARNESS_UPDATES_V1);
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
+        if !supports_harness_updates {
+            self.harness_updates.clear();
+        }
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(10);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
@@ -2059,17 +2140,19 @@ impl AppState {
                 state.apply_auth_value(value);
                 true
             }),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                |state, value| {
-                    state.apply_update(value);
-                    true
-                },
-            ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
+        if supports_harness_updates {
+            watch_tasks.push(spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_HARNESS_UPDATES,
+                |state, value| {
+                    state.apply_harness_updates(value);
+                    true
+                },
+            ));
+        }
         self.watch_tasks = watch_tasks;
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
@@ -2174,7 +2257,9 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
-        if let Some(id) = &chat_id {
+        if let Some(id) = &chat_id
+            && !self.is_unsaved_side_chat(id)
+        {
             self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
@@ -2290,14 +2375,12 @@ impl AppState {
             }
             self.mark_chat_seen(id, cx);
         }
-        if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            if handle
-                .engine_info()
-                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
-            {
-                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        if let Some(chat_id) = chat_id {
+            if self.is_unsaved_side_chat(&chat_id) {
+                // Nothing to watch yet, and opening its doc would start one.
+                self.transcript_replayed = true;
+            } else {
+                self.start_chat_watches(chat_id, cx);
             }
         }
         cx.notify();
